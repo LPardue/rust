@@ -348,7 +348,7 @@ where
         &mut self,
         origin: infer::SubregionOrigin<'tcx>,
         region: ty::Region<'tcx>,
-        projection_ty: ty::ProjectionTy<'tcx>,
+        projection_ty: ty::View<'tcx, ty::ProjectionTy<'tcx>>,
     ) where
         'tcx: 'e,
     {
@@ -389,8 +389,8 @@ where
         // #55756) in cases where you have e.g., `<T as Foo<'a>>::Item:
         // 'a` in the environment but `trait Foo<'b> { type Item: 'b
         // }` in the trait definition.
-        approx_env_bounds.retain(|bound| match bound.0.kind {
-            ty::Projection(projection_ty) => self
+        approx_env_bounds.retain(|bound| match bound.0.into() {
+            ty::view::Projection(projection_ty) => self
                 .verify_bound
                 .projection_declared_bounds_from_trait(projection_ty)
                 .all(|r| r != bound.1),

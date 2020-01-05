@@ -63,6 +63,7 @@ use crate::hir;
 use crate::infer::outlives::env::RegionBoundPairs;
 use crate::infer::outlives::verify::VerifyBoundCx;
 use crate::infer::{self, GenericKind, InferCtxt, RegionObligation, SubregionOrigin, VerifyBound};
+use crate::traits;
 use crate::traits::ObligationCause;
 use crate::ty::outlives::Component;
 use crate::ty::subst::GenericArgKind;
@@ -154,6 +155,8 @@ impl<'cx, 'tcx> InferCtxt<'cx, 'tcx> {
 
         let my_region_obligations = self.take_registered_region_obligations();
 
+        let mut elaborator = traits::Elaborator::new(self.tcx);
+
         for (body_id, RegionObligation { sup_type, sub_region, origin }) in my_region_obligations {
             debug!(
                 "process_registered_region_obligations: sup_type={:?} sub_region={:?} origin={:?}",
@@ -169,6 +172,7 @@ impl<'cx, 'tcx> InferCtxt<'cx, 'tcx> {
                     &region_bound_pairs,
                     implicit_region_bound,
                     param_env,
+                    &mut elaborator,
                 );
                 outlives.type_must_outlive(origin, sup_type, sub_region);
             } else {
@@ -191,15 +195,16 @@ impl<'cx, 'tcx> InferCtxt<'cx, 'tcx> {
         ty: Ty<'tcx>,
         region: ty::Region<'tcx>,
     ) {
-        let outlives = &mut TypeOutlives::new(
+        let ty = self.resolve_vars_if_possible(&ty);
+        TypeOutlives::new(
             self,
             self.tcx,
             region_bound_pairs,
             implicit_region_bound,
             param_env,
-        );
-        let ty = self.resolve_vars_if_possible(&ty);
-        outlives.type_must_outlive(origin, ty, region);
+            &mut traits::Elaborator::new(self.tcx),
+        )
+        .type_must_outlive(origin, ty, region);
     }
 }
 
@@ -209,7 +214,7 @@ impl<'cx, 'tcx> InferCtxt<'cx, 'tcx> {
 /// via a "delegate" of type `D` -- this is usually the `infcx`, which
 /// accrues them into the `region_obligations` code, but for NLL we
 /// use something else.
-pub struct TypeOutlives<'cx, 'tcx, D>
+pub struct TypeOutlives<'cx, 'tcx, 'e, D>
 where
     D: TypeOutlivesDelegate<'tcx>,
 {
@@ -217,7 +222,7 @@ where
     // of these fields.
     delegate: D,
     tcx: TyCtxt<'tcx>,
-    verify_bound: VerifyBoundCx<'cx, 'tcx>,
+    verify_bound: VerifyBoundCx<'cx, 'tcx, 'e>,
 }
 
 pub trait TypeOutlivesDelegate<'tcx> {
@@ -237,7 +242,7 @@ pub trait TypeOutlivesDelegate<'tcx> {
     );
 }
 
-impl<'cx, 'tcx, D> TypeOutlives<'cx, 'tcx, D>
+impl<'cx, 'tcx, 'e, D> TypeOutlives<'cx, 'tcx, 'e, D>
 where
     D: TypeOutlivesDelegate<'tcx>,
 {
@@ -247,6 +252,7 @@ where
         region_bound_pairs: &'cx RegionBoundPairs<'tcx>,
         implicit_region_bound: Option<ty::Region<'tcx>>,
         param_env: ty::ParamEnv<'tcx>,
+        elaborator: &'e mut traits::Elaborator<'tcx>,
     ) -> Self {
         Self {
             delegate,
@@ -256,6 +262,7 @@ where
                 region_bound_pairs,
                 implicit_region_bound,
                 param_env,
+                elaborator,
             ),
         }
     }
@@ -273,7 +280,9 @@ where
         origin: infer::SubregionOrigin<'tcx>,
         ty: Ty<'tcx>,
         region: ty::Region<'tcx>,
-    ) {
+    ) where
+        'tcx: 'e,
+    {
         debug!("type_must_outlive(ty={:?}, region={:?}, origin={:?})", ty, region, origin);
 
         assert!(!ty.has_escaping_bound_vars());
@@ -288,8 +297,10 @@ where
         origin: infer::SubregionOrigin<'tcx>,
         components: &[Component<'tcx>],
         region: ty::Region<'tcx>,
-    ) {
-        for component in components.iter() {
+    ) where
+        'tcx: 'e,
+    {
+        for component in components {
             let origin = origin.clone();
             match component {
                 Component::Region(region1) => {
@@ -321,7 +332,7 @@ where
         &mut self,
         origin: infer::SubregionOrigin<'tcx>,
         region: ty::Region<'tcx>,
-        param_ty: ty::ParamTy,
+        param_ty: ty::View<'tcx, ty::ParamTy>,
     ) {
         debug!(
             "param_ty_must_outlive(region={:?}, param_ty={:?}, origin={:?})",
@@ -337,8 +348,10 @@ where
         &mut self,
         origin: infer::SubregionOrigin<'tcx>,
         region: ty::Region<'tcx>,
-        projection_ty: ty::ProjectionTy<'tcx>,
-    ) {
+        projection_ty: ty::View<'tcx, ty::ProjectionTy<'tcx>>,
+    ) where
+        'tcx: 'e,
+    {
         debug!(
             "projection_must_outlive(region={:?}, projection_ty={:?}, origin={:?})",
             region, projection_ty, origin
@@ -367,8 +380,8 @@ where
         // Compute the bounds we can derive from the environment. This
         // is an "approximate" match -- in some cases, these bounds
         // may not apply.
-        let mut approx_env_bounds =
-            self.verify_bound.projection_approx_declared_bounds_from_env(projection_ty);
+        let mut approx_env_bounds: Vec<_> =
+            self.verify_bound.projection_approx_declared_bounds_from_env(projection_ty).collect();
         debug!("projection_must_outlive: approx_env_bounds={:?}", approx_env_bounds);
 
         // Remove outlives bounds that we get from the environment but
@@ -376,8 +389,8 @@ where
         // #55756) in cases where you have e.g., `<T as Foo<'a>>::Item:
         // 'a` in the environment but `trait Foo<'b> { type Item: 'b
         // }` in the trait definition.
-        approx_env_bounds.retain(|bound| match bound.0.kind {
-            ty::Projection(projection_ty) => self
+        approx_env_bounds.retain(|bound| match bound.0.into() {
+            ty::view::Projection(projection_ty) => self
                 .verify_bound
                 .projection_declared_bounds_from_trait(projection_ty)
                 .all(|r| r != bound.1),
@@ -454,7 +467,7 @@ where
     }
 }
 
-impl<'cx, 'tcx> TypeOutlivesDelegate<'tcx> for &'cx InferCtxt<'cx, 'tcx> {
+impl<'cx, 'tcx> TypeOutlivesDelegate<'tcx> for &'_ InferCtxt<'cx, 'tcx> {
     fn push_sub_region_constraint(
         &mut self,
         origin: SubregionOrigin<'tcx>,

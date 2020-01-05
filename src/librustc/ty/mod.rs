@@ -97,6 +97,8 @@ pub use self::trait_def::TraitDef;
 
 pub use self::query::queries;
 
+pub use self::view::View;
+
 pub mod adjustment;
 pub mod binding;
 pub mod cast;
@@ -119,6 +121,7 @@ pub mod steal;
 pub mod subst;
 pub mod trait_def;
 pub mod util;
+pub mod view;
 pub mod walk;
 pub mod wf;
 
